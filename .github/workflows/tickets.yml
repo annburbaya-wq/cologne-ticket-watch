@@ -1,8 +1,15 @@
 name: Check IEM tickets
 on:
   schedule:
-    - cron: '2-57/5 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'bot.py'
+      - 'detect.js'
+      - 'requirements.txt'
+      - '.github/workflows/tickets.yml'
 
 permissions:
   contents: read
