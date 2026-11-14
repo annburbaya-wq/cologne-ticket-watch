@@ -195,6 +195,7 @@ class AuditCycles(unittest.TestCase):
 
     def telegram(self, token, method, **payload):
         if method == 'getUpdates':
+            self.last_poll_offset = payload['offset']
             if self.poll_failed:
                 raise RuntimeError('network')
             return self.updates
@@ -298,6 +299,23 @@ class AuditCycles(unittest.TestCase):
         self.run_cycle()
         self.assertEqual(len([m for m in self.sent if 'reply_parameters' in m]), 1)
         self.assertEqual(self.state()['pending_requests'], [])
+
+    def test_lower_update_id_after_week_inactivity_is_not_lost(self):
+        save(self.path, {'message_offset':9000,
+                        'updates_received_at':(self.now-dt.timedelta(days=8)).isoformat()})
+        self.updates = [{'update_id':100,'message':{'message_id':12,'chat':{'id':456,'type':'private'}}}]
+        self.run_cycle()
+        self.assertEqual(self.last_poll_offset, 0)
+        self.assertEqual(len([m for m in self.sent if 'reply_parameters' in m]), 1)
+        self.assertEqual(self.state()['message_offset'], 101)
+
+    def test_custom_status_hours_are_respected(self):
+        self.run_cycle()
+        self.sent.clear()
+        self.now = self.now.replace(hour=16)
+        with patch.dict('os.environ', {'STATUS_HOURS':'9,16,21'}):
+            self.run_cycle()
+        self.assertEqual(len(self.sent), 2)
 
     def test_unknown_status_is_rejected(self):
         with self.assertRaises(ValueError):message_for({'status':'unknown'})

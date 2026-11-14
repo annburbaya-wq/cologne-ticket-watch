@@ -125,7 +125,9 @@ def message_for(result):
 
 def tick_result(state, result, now, send):
     """One successful scheduled observation; update state after delivery."""
-    hours = [9, 15, 21]
+    hours = sorted(set(int(h) for h in os.environ.get('STATUS_HOURS', '9,15,21').split(',')))
+    if not hours or any(h < 0 or h > 23 for h in hours):
+        raise ValueError('STATUS_HOURS must contain hours from 0 to 23')
     due = [h for h in hours if h <= now.hour]
     slot = now.strftime('%Y-%m-%d') + ('T%02d' % due[-1]) if due else None
     changed = (state.get('status') != result['status']
@@ -236,7 +238,7 @@ def load_state(path):
 
 def cycle(token, chat_ids, state_path, observe, clock=None):
     state = load_state(state_path)
-    clock = clock or (lambda: dt.datetime.now(ZoneInfo('Europe/Berlin')))
+    clock = clock or (lambda: dt.datetime.now(ZoneInfo(os.environ.get('TIMEZONE', 'Europe/Berlin'))))
     persist = lambda: save(state_path, state)
     def send(chat, text):
         telegram(token, 'sendMessage', chat_id=chat, text=text,
@@ -266,6 +268,11 @@ def cycle(token, chat_ids, state_path, observe, clock=None):
                      last_checked=now.isoformat())
         delivery_failures = notify_chats(state, chat_ids, token, result, now, send, persist)
     persist()
+    last_update = state.get('updates_received_at', now.isoformat())
+    # Telegram may choose a lower random update ID after a week of inactivity.
+    if now - dt.datetime.fromisoformat(last_update) >= dt.timedelta(days=6):
+        state['message_offset'] = 0
+    state.setdefault('updates_received_at', now.isoformat())
     try:
         updates = telegram(token, 'getUpdates', offset=state.get('message_offset', 0),
                            limit=100, timeout=0, allowed_updates=['message'])
@@ -273,6 +280,8 @@ def cycle(token, chat_ids, state_path, observe, clock=None):
         updates = []
         delivery_failures += 1
         print('Telegram polling failed', flush=True)
+    if updates:
+        state['updates_received_at'] = now.isoformat()
     def reply(chat, message_id, text):
         telegram(token, 'sendMessage', chat_id=chat, text=text,
                  link_preview_options={'is_disabled': True},

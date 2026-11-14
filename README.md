@@ -1,9 +1,52 @@
 # Cologne ticket watch
 
-Monitors ESL's Wave 2 / 1-Day Lower announcement card and sends Telegram notifications.
+Бот проверяет карточку **Wave 2 → 1-Day Lower** на странице
+https://pro.eslgaming.com/tour/cs/cologne/ и отправляет результат в разрешённые
+личные чаты Telegram. Остатки конкретных дней в магазине Vivenu не проверяются.
 
-Checks run every five minutes via GitHub Actions; scheduling delays are possible. Status reports follow 09:00, 15:00 and 21:00 Europe/Berlin.
+## Текущий запуск: GitHub Actions
 
-Send any message to the bot from the configured private chat to receive the result of the next fresh check. Each request gets a reply, usually at the next scheduled run; this is not an instant webhook service. Other chats are ignored. Message text is not saved or logged.
+В `.github/workflows/tickets.yml` задано расписание каждые 5 минут,
+ручной запуск и запуск при изменении кода. Для уведомлений нужны Secrets
+`TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`; несколько числовых chat ID разделяются
+запятыми. Нельзя публиковать `data/config.json` или значения секретов.
 
-Secrets are stored only in GitHub Actions Secrets. No checkout inventory checks or purchases. Public-repository standard runners are free. GitHub may disable schedules after 60 days of repository inactivity. Check the Actions tab periodically.
+На момент аудита 14.11.2026 ручные запуски и запуски при обновлении кода успешны,
+но **ни одного запуска с событием schedule ещё не наблюдалось**. Автономная
+работа пока не подтверждена. Зелёный ручной запуск не доказывает работу расписания.
+
+Любое новое сообщение от разрешённого аккаунта получает статус при следующем
+запуске. Если сайт недоступен, ответ содержит последний успешный результат с его
+временем либо сообщает, что наличие неизвестно. Мгновенных ответов между
+запусками GitHub нет. Неудавшиеся ответы сохраняются для повторной отправки;
+ошибка в одном чате не блокирует второй. Посторонние аккаунты и группы игнорируются.
+
+Статусы отправляются после 09:00, 15:00 и 21:00 Europe/Berlin. При появлении
+покупки приходит отдельное сообщение с **🚨🚨🚨 и !!!**; неизменный статус
+между сводками не рассылается повторно. Кэш хранит статус, время и очередь
+метаданных запросов, без текста сообщений, токена и открытых chat ID. Потеря
+кэша или сбой сразу после отправки может привести к повторному сообщению.
+
+## Проверки
+
+```sh
+pip install -r requirements.txt
+python -m playwright install --with-deps chromium
+python -m unittest discover -v
+```
+
+Тесты подменяют Telegram и используют искусственные HTML-страницы; ложные
+уведомления о продаже пользователям не отправляются. После тестов сервер
+проверяет настоящий ESL и обрабатывает реальные запросы Telegram.
+
+## Альтернативный непрерывный запуск
+
+Docker Compose или `python bot.py run` используют тот же цикл и поддержку
+нескольких чатов; частота задаётся CHECK_SECONDS (минимум 60 секунд), часы —
+STATUS_HOURS, часовой пояс — TIMEZONE. Нужны приватный `data/config.json` и
+постоянно работающий сервер. Этот способ не развёрнут и Docker на Mac не проверялся.
+Не запускайте его одновременно с GitHub для одного Telegram-бота.
+
+Ограничения GitHub: задержки и пропуски расписания, отключение после 60 дней
+без активности репозитория; ошибки до запуска Python видны только в Actions.
+https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule
