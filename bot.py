@@ -105,8 +105,9 @@ def check(page):
 def message_for(result):
     status = result['status']
     if status == 'sale_link':
-        return ('🎟 На странице ESL появилась ссылка покупки!\n' + LABEL
-                + '\nПроверьте наличие на нужный день в магазине:\n' + result['url'])
+        return ('🚨🚨🚨 WAVE 2: ПОЯВИЛАСЬ ССЫЛКА ПОКУПКИ!!!\n' + LABEL
+                + '\nНа странице ESL появилась ссылка покупки!!!'
+                + '\nСкорее проверьте наличие на нужный день в магазине:\n' + result['url'])
     if status == 'coming_soon':
         return '⏳ ' + LABEL + '\nПродажа пока не открыта: Coming soon.\n' + URL
     return '⏳ ' + LABEL + '\nНа странице указано Sold out.\n' + URL
