@@ -2,6 +2,8 @@
 import argparse
 import datetime as dt
 import getpass
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -128,16 +130,44 @@ def tick_result(state, result, now, send):
     state.update(status=result['status'], failures=0, last_success=now.isoformat())
 
 
+def configured_chats(value):
+    """The private secret can contain one or several numeric chat IDs."""
+    chats = list(dict.fromkeys(re.split(r'[,\s]+', str(value).strip())))
+    if not chats or any(not re.fullmatch(r'[0-9]+', chat) for chat in chats):
+        raise ValueError('TELEGRAM_CHAT_ID must contain private chat IDs')
+    return chats
+
+
+def notify_chats(state, chat_ids, token, result, now, send, persist):
+    """Keep delivery state per recipient without storing their IDs in the cache."""
+    deliveries = state.setdefault('deliveries', {})
+    failures = 0
+    for index, chat in enumerate(chat_ids):
+        key = hmac.new(token.encode(), chat.encode(), hashlib.sha256).hexdigest()
+        if key not in deliveries:
+            # Preserve the original owner's delivery history during migration.
+            deliveries[key] = ({k: state[k] for k in
+                               ('status', 'last_slot', 'failures', 'last_success') if k in state}
+                              if index == 0 else {})
+        try:
+            tick_result(deliveries[key], result, now, lambda text: send(chat, text))
+        except RuntimeError:
+            failures += 1
+        persist()
+    return failures
+
+
 def answer_requests(state, updates, chat_id, result, now, reply, persist):
-    """Reply to each owner message using this cycle's fresh observation."""
+    """Reply only to configured private chats using a fresh observation."""
+    chat_ids = set(configured_chats(chat_id))
     answered = 0
     for update in sorted(updates, key=lambda item: item['update_id']):
         if update['update_id'] < state.get('message_offset', 0):
             continue
         message = update.get('message', {})
         if (message.get('chat', {}).get('type') == 'private'
-                and str(message['chat']['id']) == str(chat_id)):
-            reply(message['message_id'],
+                and str(message['chat']['id']) in chat_ids):
+            reply(str(message['chat']['id']), message['message_id'],
                   '🔎 Проверка по вашему сообщению:\n' + message_for(result)
                   + '\nПроверено: ' + now.strftime('%d.%m %H:%M %Z'))
             answered += 1
@@ -150,13 +180,13 @@ def answer_requests(state, updates, chat_id, result, now, reply, persist):
 def scheduled():
     from playwright.sync_api import sync_playwright
     token = os.environ['TELEGRAM_BOT_TOKEN']
-    chat_id = os.environ['TELEGRAM_CHAT_ID']
+    chat_ids = configured_chats(os.environ['TELEGRAM_CHAT_ID'])
     state_path = DATA / 'state.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     now = dt.datetime.now(ZoneInfo('Europe/Berlin'))
 
-    def send(text):
-        telegram(token, 'sendMessage', chat_id=chat_id, text=text)
+    def send(chat, text):
+        telegram(token, 'sendMessage', chat_id=chat, text=text)
 
     try:
         with sync_playwright() as pw:
@@ -165,18 +195,20 @@ def scheduled():
                 result = check(browser.new_page())
             finally:
                 browser.close()
-        tick_result(state, result, now, send)
-        save(state_path, state)
+        delivery_failures = notify_chats(state, chat_ids, token, result, now, send,
+                                         lambda: save(state_path, state))
         updates = telegram(token, 'getUpdates', offset=state.get('message_offset', 0),
                            limit=100, timeout=0, allowed_updates=['message'])
 
-        def reply(message_id, text):
-            telegram(token, 'sendMessage', chat_id=chat_id, text=text,
+        def reply(chat, message_id, text):
+            telegram(token, 'sendMessage', chat_id=chat, text=text,
                      reply_parameters={'message_id': message_id,
                                        'allow_sending_without_reply': True})
 
-        answered = answer_requests(state, updates, chat_id, result, now, reply,
+        answered = answer_requests(state, updates, ','.join(chat_ids), result, now, reply,
                                    lambda: save(state_path, state))
+        if delivery_failures:
+            raise RuntimeError('Some notification deliveries failed')
         print('Message requests answered:', answered, flush=True)
         print(now.isoformat(), result['status'], flush=True)
     except Exception as error:
@@ -184,8 +216,12 @@ def scheduled():
         # Alert on the first failure as well, so failed initial setup is visible.
         if state['failures'] in (1, 3) or state['failures'] % 12 == 0:
             try:
-                send('⚠️ Проверка билетов или доставка не удалась. '
-                     'Наличие неизвестно. Проверьте вкладку Actions на GitHub.\n' + URL)
+                for chat in chat_ids:
+                    try:
+                        send(chat, '⚠️ Проверка билетов или доставка не удалась. '
+                             'Наличие неизвестно. Проверьте вкладку Actions на GitHub.\n' + URL)
+                    except RuntimeError:
+                        print('Telegram delivery failed', flush=True)
             except RuntimeError:
                 print('Telegram delivery failed', flush=True)
         save(state_path, state)

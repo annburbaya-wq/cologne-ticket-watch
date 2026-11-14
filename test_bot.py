@@ -4,7 +4,7 @@ import urllib.error
 import ssl
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
-from bot import tick_result, telegram, answer_requests
+from bot import tick_result, telegram, answer_requests, configured_chats, notify_chats
 
 
 class MessageRequests(unittest.TestCase):
@@ -17,7 +17,7 @@ class MessageRequests(unittest.TestCase):
     def process(self, updates, reply=None):
         return answer_requests(
             self.state, updates, 123, {'status': 'coming_soon'}, self.now,
-            reply or (lambda message_id, text: self.replies.append((message_id, text))),
+            reply or (lambda chat_id, message_id, text: self.replies.append((message_id, text))),
             lambda: self.saved_offsets.append(self.state['message_offset']))
 
     def update(self, number, chat=123, **content):
@@ -50,6 +50,37 @@ class MessageRequests(unittest.TestCase):
         self.assertNotIn('message_offset', self.state)
         self.process([self.update(1)])
         self.assertEqual(len(self.replies), 1)
+
+
+class MultipleChats(unittest.TestCase):
+    def test_allowlisted_chats_receive_replies_in_their_own_chat(self):
+        updates = [dict(update_id=i, message=dict(message_id=i+10,
+                   chat=dict(id=chat, type='private'), text='tickets?'))
+                   for i, chat in enumerate([123, 456, 999], 1)]
+        replies = []
+        state = {}
+        count = answer_requests(state, updates, '123,456', {'status': 'coming_soon'},
+                                dt.datetime.now(ZoneInfo('Europe/Berlin')),
+                                lambda chat, mid, text: replies.append((chat, mid)), lambda: None)
+        self.assertEqual(count, 2)
+        self.assertEqual(replies, [('123', 11), ('456', 12)])
+
+    def test_recipient_failure_does_not_repeat_successful_alert(self):
+        state, sent = {}, []
+        now = dt.datetime(2026, 11, 14, 14, 0, tzinfo=ZoneInfo('Europe/Berlin'))
+        def send(chat, text):
+            if chat == '456':
+                raise RuntimeError('blocked')
+            sent.append(chat)
+        for _ in range(2):
+            self.assertEqual(notify_chats(state, ['123', '456'], 'secret',
+                             {'status': 'coming_soon'}, now, send, lambda: None), 1)
+        self.assertEqual(sent, ['123'])
+        self.assertNotIn('123', state['deliveries'])
+        self.assertNotIn('456', state['deliveries'])
+
+    def test_chat_secret_supports_spaces_and_deduplicates(self):
+        self.assertEqual(configured_chats('123, 456\n123'), ['123', '456'])
 
 
 class TelegramErrors(unittest.TestCase):
