@@ -42,13 +42,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -m unittest -v test_bot
+          python -m unittest discover -v
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "Telegram is not configured yet; checking site access only."
-            python bot.py check
-          else
-            python bot.py scheduled
+            echo "Required Telegram secrets are missing; monitor cannot run."
+            exit 1
           fi
+          python bot.py scheduled
       - name: Remember last delivered status
         if: always() && hashFiles('data/state.json') != ''
         uses: actions/cache/save@v4
