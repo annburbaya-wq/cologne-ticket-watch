@@ -4,7 +4,52 @@ import urllib.error
 import ssl
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
-from bot import tick_result, telegram
+from bot import tick_result, telegram, answer_requests
+
+
+class MessageRequests(unittest.TestCase):
+    def setUp(self):
+        self.state = {}
+        self.now = dt.datetime(2026, 11, 14, 14, 7, tzinfo=ZoneInfo('Europe/Berlin'))
+        self.replies = []
+        self.saved_offsets = []
+
+    def process(self, updates, reply=None):
+        return answer_requests(
+            self.state, updates, 123, {'status': 'coming_soon'}, self.now,
+            reply or (lambda message_id, text: self.replies.append((message_id, text))),
+            lambda: self.saved_offsets.append(self.state['message_offset']))
+
+    def update(self, number, chat=123, **content):
+        return {'update_id': number, 'message': {
+            'message_id': number + 10, 'chat': {'id': chat, 'type': 'private'}, **content}}
+
+    def test_arbitrary_text_and_photo_get_fresh_status(self):
+        self.assertEqual(self.process([self.update(1, text='привет'), self.update(2, photo=[])]), 2)
+        self.assertEqual([r[0] for r in self.replies], [11, 12])
+        self.assertIn('Coming soon', self.replies[0][1])
+        self.assertIn('14:07', self.replies[0][1])
+        self.assertEqual(self.saved_offsets, [2, 3])
+
+    def test_other_chat_cannot_request_checks(self):
+        self.assertEqual(self.process([self.update(1, chat=999, text='check')]), 0)
+        self.assertEqual(self.replies, [])
+        self.assertEqual(self.state['message_offset'], 2)
+
+    def test_replayed_updates_do_not_duplicate_replies(self):
+        update = self.update(1, text='билеты?')
+        self.process([update])
+        self.process([update])
+        self.assertEqual(len(self.replies), 1)
+
+    def test_failed_reply_does_not_acknowledge_request(self):
+        def failed(*_):
+            raise RuntimeError('offline')
+        with self.assertRaises(RuntimeError):
+            self.process([self.update(1)], failed)
+        self.assertNotIn('message_offset', self.state)
+        self.process([self.update(1)])
+        self.assertEqual(len(self.replies), 1)
 
 
 class TelegramErrors(unittest.TestCase):

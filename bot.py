@@ -127,6 +127,25 @@ def tick_result(state, result, now, send):
     state.update(status=result['status'], failures=0, last_success=now.isoformat())
 
 
+def answer_requests(state, updates, chat_id, result, now, reply, persist):
+    """Reply to each owner message using this cycle's fresh observation."""
+    answered = 0
+    for update in sorted(updates, key=lambda item: item['update_id']):
+        if update['update_id'] < state.get('message_offset', 0):
+            continue
+        message = update.get('message', {})
+        if (message.get('chat', {}).get('type') == 'private'
+                and str(message['chat']['id']) == str(chat_id)):
+            reply(message['message_id'],
+                  '🔎 Проверка по вашему сообщению:\n' + message_for(result)
+                  + '\nПроверено: ' + now.strftime('%d.%m %H:%M %Z'))
+            answered += 1
+        # Save after successful delivery, so failed replies are retried.
+        state['message_offset'] = update['update_id'] + 1
+        persist()
+    return answered
+
+
 def scheduled():
     from playwright.sync_api import sync_playwright
     token = os.environ['TELEGRAM_BOT_TOKEN']
@@ -147,6 +166,17 @@ def scheduled():
                 browser.close()
         tick_result(state, result, now, send)
         save(state_path, state)
+        updates = telegram(token, 'getUpdates', offset=state.get('message_offset', 0),
+                           limit=100, timeout=0, allowed_updates=['message'])
+
+        def reply(message_id, text):
+            telegram(token, 'sendMessage', chat_id=chat_id, text=text,
+                     reply_parameters={'message_id': message_id,
+                                       'allow_sending_without_reply': True})
+
+        answered = answer_requests(state, updates, chat_id, result, now, reply,
+                                   lambda: save(state_path, state))
+        print('Message requests answered:', answered, flush=True)
         print(now.isoformat(), result['status'], flush=True)
     except Exception as error:
         state['failures'] = state.get('failures', 0) + 1
