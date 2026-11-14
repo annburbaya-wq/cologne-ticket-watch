@@ -2,9 +2,12 @@ import datetime as dt
 import unittest
 import urllib.error
 import ssl
+import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
-from bot import tick_result, telegram, answer_requests, configured_chats, notify_chats
+from bot import tick_result, telegram, answer_requests, configured_chats, notify_chats, cycle, recipient_key, message_for, TelegramError, save
 
 
 class MessageRequests(unittest.TestCase):
@@ -29,7 +32,7 @@ class MessageRequests(unittest.TestCase):
         self.assertEqual([r[0] for r in self.replies], [11, 12])
         self.assertIn('Coming soon', self.replies[0][1])
         self.assertIn('14:07', self.replies[0][1])
-        self.assertEqual(self.saved_offsets, [2, 3])
+        self.assertEqual(self.saved_offsets[:2], [2, 3])
 
     def test_other_chat_cannot_request_checks(self):
         self.assertEqual(self.process([self.update(1, chat=999, text='check')]), 0)
@@ -42,14 +45,45 @@ class MessageRequests(unittest.TestCase):
         self.process([update])
         self.assertEqual(len(self.replies), 1)
 
-    def test_failed_reply_does_not_acknowledge_request(self):
+    def test_failed_reply_is_persisted_and_retried_without_new_update(self):
         def failed(*_):
             raise RuntimeError('offline')
-        with self.assertRaises(RuntimeError):
-            self.process([self.update(1)], failed)
-        self.assertNotIn('message_offset', self.state)
-        self.process([self.update(1)])
+        self.assertEqual(self.process([self.update(1)], failed), 0)
+        self.assertEqual(len(self.state['pending_requests']), 1)
+        self.process([])
         self.assertEqual(len(self.replies), 1)
+        self.assertEqual(self.state['pending_requests'], [])
+
+    def test_failed_first_chat_does_not_block_second_or_repeat_success(self):
+        delivered = []
+        def send(chat, mid, text):
+            if chat == '123':
+                raise RuntimeError('offline')
+            delivered.append(chat)
+        updates = [self.update(1), self.update(2, chat=456)]
+        for batch in [updates, []]:
+            answer_requests(self.state, batch, '123,456', {'status': 'coming_soon'},
+                            self.now, send, lambda: None)
+        self.assertEqual(delivered, ['456'])
+        self.assertEqual(len(self.state['pending_requests']), 1)
+        self.assertNotIn('chat_id', self.state['pending_requests'][0])
+        self.assertNotIn('text', self.state['pending_requests'][0])
+
+    def test_blocked_chat_does_not_remain_queued(self):
+        def blocked(*_):
+            raise TelegramError('blocked', 403)
+        self.process([self.update(1)], blocked)
+        self.assertEqual(self.state['pending_requests'], [])
+
+    def test_group_using_same_id_cannot_request(self):
+        update = self.update(1)
+        update['message']['chat']['type'] = 'group'
+        self.assertEqual(self.process([update]), 0)
+
+    def test_unauthorized_updates_never_enter_pending_queue(self):
+        self.process([self.update(1, chat=999, text='secret text')])
+        self.assertEqual(self.state['pending_requests'], [])
+
 
 
 class MultipleChats(unittest.TestCase):
@@ -146,6 +180,127 @@ class ScheduledNotifications(unittest.TestCase):
         self.assertEqual(self.state['status'], 'coming_soon')
         self.tick({'status': 'sale_link', 'url': 'https://example.com'})
         self.assertEqual(self.state['status'], 'sale_link')
+
+
+class AuditCycles(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'state.json'
+        self.now = dt.datetime(2026, 11, 14, 14, 7, 30, tzinfo=ZoneInfo('Europe/Berlin'))
+        self.sent = []
+        self.updates = []
+        self.blocked = None
+        self.poll_failed = False
+
+    def telegram(self, token, method, **payload):
+        if method == 'getUpdates':
+            if self.poll_failed:
+                raise RuntimeError('network')
+            return self.updates
+        if payload['chat_id'] == self.blocked:
+            raise TelegramError('blocked', 403)
+        self.sent.append(payload)
+        return {'message_id': 50}
+
+    def run_cycle(self, observe=None):
+        with patch('bot.telegram', side_effect=self.telegram):
+            cycle('123:secret', ['123', '456'], self.path,
+                  observe or (lambda: {'status': 'coming_soon'}), lambda: self.now)
+
+    def state(self):
+        return json.loads(self.path.read_text())
+
+    def test_both_recipients_notified_and_unchanged_cycle_quiet(self):
+        self.run_cycle()
+        self.run_cycle()
+        self.assertEqual([m['chat_id'] for m in self.sent], ['123', '456'])
+
+    def test_site_down_answers_with_dated_previous_observation(self):
+        self.run_cycle()
+        self.sent.clear()
+        self.updates = [{'update_id':1,'message':{'message_id':12,'chat':{'id':456,'type':'private'}}}]
+        def down():
+            raise RuntimeError('ESL unavailable')
+        with self.assertRaises(RuntimeError):
+            self.run_cycle(down)
+        reply = [m for m in self.sent if 'reply_parameters' in m][0]
+        self.assertEqual(reply['chat_id'], '456')
+        self.assertIn('Последний успешный результат', reply['text'])
+        self.assertIn(self.now.isoformat(), reply['text'])
+        self.assertEqual(self.state()['last_result']['status'], 'coming_soon')
+
+    def test_first_site_failure_does_not_invent_availability(self):
+        self.updates = [{'update_id':1,'message':{'message_id':12,'chat':{'id':123,'type':'private'}}}]
+        def down():raise RuntimeError('down')
+        with self.assertRaises(RuntimeError):self.run_cycle(down)
+        reply = [m for m in self.sent if 'reply_parameters' in m][0]
+        self.assertIn('неизвестно', reply['text'])
+        self.assertNotIn('Coming soon', reply['text'])
+        self.assertNotIn('Sold out', reply['text'])
+
+    def test_failures_reset_and_restoration_notices_only_once(self):
+        self.run_cycle()
+        def down():raise RuntimeError('down')
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):self.run_cycle(down)
+        self.sent.clear()
+        self.run_cycle()
+        self.run_cycle()
+        self.assertEqual(self.state()['failures'], 0)
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all('восстановились' in m['text'] for m in self.sent))
+
+    def test_one_blocked_recipient_does_not_spam_other_or_claim_site_failure(self):
+        self.blocked = '123'
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):self.run_cycle()
+        self.assertEqual([m['chat_id'] for m in self.sent], ['456'])
+        self.assertNotIn('сайта не удалась', self.sent[0]['text'])
+
+    def test_poll_failure_still_retries_saved_queue(self):
+        key = recipient_key('123:secret', '456')
+        save(self.path, {'pending_requests':[{'recipient':key,'message_id':10,'update_id':1}]})
+        self.poll_failed = True
+        with self.assertRaises(RuntimeError):self.run_cycle()
+        self.assertEqual(len([m for m in self.sent if 'reply_parameters' in m]), 1)
+        self.assertEqual(self.state()['pending_requests'], [])
+
+    def test_unknown_status_does_not_overwrite_previous_observation(self):
+        self.run_cycle()
+        with self.assertRaises(RuntimeError):self.run_cycle(lambda: {'status':'unknown'})
+        self.assertEqual(self.state()['last_result']['status'], 'coming_soon')
+
+    def test_corrupt_cache_recovers_and_saves_atomic_file(self):
+        self.path.write_text('{invalid')
+        self.run_cycle()
+        self.assertEqual(self.state()['last_result']['status'], 'coming_soon')
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(self.path.with_suffix('.tmp').exists())
+
+    def test_sale_url_change_generates_new_alert_and_next_day_has_report(self):
+        self.run_cycle(lambda: {'status':'sale_link','url':'https://example.com/a'})
+        self.sent.clear()
+        self.run_cycle(lambda: {'status':'sale_link','url':'https://example.com/b'})
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all('🚨🚨🚨' in m['text'] and '!!!' in m['text'] for m in self.sent))
+        self.sent.clear()
+        self.now += dt.timedelta(days=1)
+        self.run_cycle(lambda: {'status':'sale_link','url':'https://example.com/b'})
+        self.assertEqual(len(self.sent), 2)
+
+    def test_failed_reply_survives_process_restart(self):
+        self.run_cycle()
+        key = recipient_key('123:secret', '456')
+        state = self.state()
+        state['pending_requests'] = [{'recipient':key,'message_id':12,'update_id':1}]
+        save(self.path, state)
+        self.run_cycle()
+        self.assertEqual(len([m for m in self.sent if 'reply_parameters' in m]), 1)
+        self.assertEqual(self.state()['pending_requests'], [])
+
+    def test_unknown_status_is_rejected(self):
+        with self.assertRaises(ValueError):message_for({'status':'unknown'})
 
 
 if __name__ == '__main__':

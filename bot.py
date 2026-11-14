@@ -32,6 +32,12 @@ def save(path, data):
     tmp.replace(path)
 
 
+class TelegramError(RuntimeError):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
 def telegram(token, method, **payload):
     if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+', token):
         raise RuntimeError('Неверный формат токена. Скопируйте только токен из BotFather, без кавычек и пояснений.')
@@ -53,7 +59,7 @@ def telegram(token, method, **payload):
             409: 'Другой процесс уже читает сообщения этого бота (409). Остановите его и повторите подключение.',
             429: 'Слишком много запросов к Telegram (429). Подождите минуту и повторите.',
         }
-        raise RuntimeError(messages.get(error.code, 'Telegram вернул HTTP ' + str(error.code) + '. Повторите позже.')) from None
+        raise TelegramError(messages.get(error.code, 'Telegram вернул HTTP ' + str(error.code) + '. Повторите позже.'), error.code) from None
     except urllib.error.URLError as error:
         if isinstance(error.reason, ssl.SSLCertVerificationError):
             message = 'Python не смог проверить сертификат Telegram (SSL). Нужна настройка сертификатов Python.'
@@ -112,7 +118,9 @@ def message_for(result):
                 + '\nСкорее проверьте наличие на нужный день в магазине:\n' + result['url'])
     if status == 'coming_soon':
         return '⏳ ' + LABEL + '\nПродажа пока не открыта: Coming soon.\n' + URL
-    return '⏳ ' + LABEL + '\nНа странице указано Sold out.\n' + URL
+    if status == 'sold_out':
+        return '⏳ ' + LABEL + '\nНа странице указано Sold out.\n' + URL
+    raise ValueError('Unknown availability status')
 
 
 def tick_result(state, result, now, send):
@@ -120,14 +128,15 @@ def tick_result(state, result, now, send):
     hours = [9, 15, 21]
     due = [h for h in hours if h <= now.hour]
     slot = now.strftime('%Y-%m-%d') + ('T%02d' % due[-1]) if due else None
-    changed = state.get('status') != result['status']
+    changed = (state.get('status') != result['status']
+               or (result['status'] == 'sale_link' and state.get('url') != result.get('url')))
     recovered = state.get('failures', 0) >= 3
     if changed or recovered or (slot and state.get('last_slot', '') < slot):
         prefix = '✅ Проверки восстановились.\n' if recovered else ''
         send(prefix + message_for(result) + '\nПроверено: ' + now.strftime('%d.%m %H:%M %Z'))
         if slot:
             state['last_slot'] = slot
-    state.update(status=result['status'], failures=0, last_success=now.isoformat())
+    state.update(status=result['status'], url=result.get('url'), failures=0, last_success=now.isoformat())
 
 
 def configured_chats(value):
@@ -138,156 +147,175 @@ def configured_chats(value):
     return chats
 
 
+def recipient_key(token, chat):
+    return hmac.new(token.encode(), str(chat).encode(), hashlib.sha256).hexdigest()
+
+
 def notify_chats(state, chat_ids, token, result, now, send, persist):
     """Keep delivery state per recipient without storing their IDs in the cache."""
     deliveries = state.setdefault('deliveries', {})
     failures = 0
     for index, chat in enumerate(chat_ids):
-        key = hmac.new(token.encode(), chat.encode(), hashlib.sha256).hexdigest()
+        key = recipient_key(token, chat)
         if key not in deliveries:
             # Preserve the original owner's delivery history during migration.
             deliveries[key] = ({k: state[k] for k in
-                               ('status', 'last_slot', 'failures', 'last_success') if k in state}
+                               ('status', 'url', 'last_slot', 'failures', 'last_success') if k in state}
                               if index == 0 else {})
         try:
             tick_result(deliveries[key], result, now, lambda text: send(chat, text))
         except RuntimeError:
             failures += 1
+            deliveries[key]['failures'] = deliveries[key].get('failures', 0) + 1
         persist()
     return failures
 
 
-def answer_requests(state, updates, chat_id, result, now, reply, persist):
-    """Reply only to configured private chats using a fresh observation."""
-    chat_ids = set(configured_chats(chat_id))
-    answered = 0
+def answer_requests(state, updates, chat_id, result, now, reply, persist,
+                    token='', checked_at=None, check_failed=False):
+    """Persist requests before acknowledging, then isolate each chat's delivery."""
+    chats = configured_chats(chat_id)
+    recipients = {recipient_key(token, chat): chat for chat in chats}
+    pending = state.setdefault('pending_requests', [])
     for update in sorted(updates, key=lambda item: item['update_id']):
         if update['update_id'] < state.get('message_offset', 0):
             continue
         message = update.get('message', {})
-        if (message.get('chat', {}).get('type') == 'private'
-                and str(message['chat']['id']) in chat_ids):
-            reply(str(message['chat']['id']), message['message_id'],
-                  '🔎 Проверка по вашему сообщению:\n' + message_for(result)
-                  + '\nПроверено: ' + now.strftime('%d.%m %H:%M %Z'))
-            answered += 1
-        # Save after successful delivery, so failed replies are retried.
+        key = recipient_key(token, message.get('chat', {}).get('id', ''))
+        if message.get('chat', {}).get('type') == 'private' and key in recipients:
+            pending.append({'update_id': update['update_id'],
+                            'message_id': message['message_id'], 'recipient': key})
+        # A failed reply remains in the durable queue; later messages can proceed.
         state['message_offset'] = update['update_id'] + 1
+        persist()
+    if result is None:
+        text = '⚠️ Проверить сайт не удалось. Текущее наличие неизвестно.\n' + URL
+    elif check_failed:
+        text = ('⚠️ Свежая проверка не удалась. Последний успешный результат:\n'
+                + message_for(result) + '\nПроверено: ' + checked_at)
+    else:
+        text = ('🔎 Проверка по вашему сообщению:\n' + message_for(result)
+                + '\nПроверено: ' + now.strftime('%d.%m %H:%M:%S %Z'))
+    answered = 0
+    for request in list(pending):
+        chat = recipients.get(request['recipient'])
+        if chat is None:
+            pending.remove(request)
+            persist()
+            continue
+        try:
+            reply(chat, request['message_id'], text)
+        except RuntimeError as error:
+            if getattr(error, 'code', None) != 403:
+                continue
+            # A blocked bot cannot deliver; don't keep this request indefinitely.
+        else:
+            answered += 1
+        pending.remove(request)
         persist()
     return answered
 
 
-def scheduled():
-    from playwright.sync_api import sync_playwright
-    token = os.environ['TELEGRAM_BOT_TOKEN']
-    chat_ids = configured_chats(os.environ['TELEGRAM_CHAT_ID'])
-    state_path = DATA / 'state.json'
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
-    now = dt.datetime.now(ZoneInfo('Europe/Berlin'))
-
-    def send(chat, text):
-        telegram(token, 'sendMessage', chat_id=chat, text=text)
-
+def load_state(path):
+    if not path.exists():
+        return {}
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            try:
-                result = check(browser.new_page())
-            finally:
-                browser.close()
-        delivery_failures = notify_chats(state, chat_ids, token, result, now, send,
-                                         lambda: save(state_path, state))
+        state = json.loads(path.read_text())
+        if (not isinstance(state, dict)
+                or not isinstance(state.get('deliveries', {}), dict)
+                or not isinstance(state.get('pending_requests', []), list)
+                or any(not isinstance(r, dict) or not {'recipient', 'message_id', 'update_id'} <= r.keys()
+                       for r in state.get('pending_requests', []))):
+            raise ValueError('Invalid cached state schema')
+        return state
+    except (ValueError, OSError):
+        # Loss of cached history can repeat a status, but must not stop monitoring.
+        print('Cached state unreadable; starting with fresh state', flush=True)
+        return {}
+
+
+def cycle(token, chat_ids, state_path, observe, clock=None):
+    state = load_state(state_path)
+    clock = clock or (lambda: dt.datetime.now(ZoneInfo('Europe/Berlin')))
+    persist = lambda: save(state_path, state)
+    def send(chat, text):
+        telegram(token, 'sendMessage', chat_id=chat, text=text,
+                 link_preview_options={'is_disabled': True})
+    check_failed = False
+    delivery_failures = 0
+    try:
+        result = observe()
+        message_for(result)  # Reject unknown states before changing saved availability.
+    except Exception as error:
+        print('Site check failed:', type(error).__name__, flush=True)
+        check_failed = True
+        state['failures'] = state.get('failures', 0) + 1
+        result = state.get('last_result')
+        if state['failures'] in (1, 3) or state['failures'] % 12 == 0:
+            for chat in chat_ids:
+                try:
+                    send(chat, '⚠️ Проверка сайта не удалась. Текущее наличие неизвестно.\n' + URL)
+                except RuntimeError:
+                    delivery_failures += 1
+    now = clock()  # Timestamp the completed observation, not the browser startup.
+    if not check_failed:
+        if state.get('failures', 0) >= 3:
+            for delivery in state.get('deliveries', {}).values():
+                delivery['failures'] = max(3, delivery.get('failures', 0))
+        state.update(failures=0, last_result={k: result[k] for k in ('status', 'url') if k in result},
+                     last_checked=now.isoformat())
+        delivery_failures = notify_chats(state, chat_ids, token, result, now, send, persist)
+    persist()
+    try:
         updates = telegram(token, 'getUpdates', offset=state.get('message_offset', 0),
                            limit=100, timeout=0, allowed_updates=['message'])
+    except RuntimeError:
+        updates = []
+        delivery_failures += 1
+        print('Telegram polling failed', flush=True)
+    def reply(chat, message_id, text):
+        telegram(token, 'sendMessage', chat_id=chat, text=text,
+                 link_preview_options={'is_disabled': True},
+                 reply_parameters={'message_id': message_id, 'allow_sending_without_reply': True})
+    answered = answer_requests(state, updates, ','.join(chat_ids), result, now, reply, persist,
+                               token=token, checked_at=state.get('last_checked'),
+                               check_failed=check_failed)
+    print('Message requests answered:', answered, '; pending:', len(state['pending_requests']), flush=True)
+    persist()
+    if check_failed or delivery_failures or state['pending_requests']:
+        raise RuntimeError('Check or delivery incomplete; see safe diagnostic above')
+    print(now.isoformat(), result['status'], '; recipients:', len(chat_ids), flush=True)
 
-        def reply(chat, message_id, text):
-            telegram(token, 'sendMessage', chat_id=chat, text=text,
-                     reply_parameters={'message_id': message_id,
-                                       'allow_sending_without_reply': True})
 
-        answered = answer_requests(state, updates, ','.join(chat_ids), result, now, reply,
-                                   lambda: save(state_path, state))
-        if delivery_failures:
-            raise RuntimeError('Some notification deliveries failed')
-        print('Message requests answered:', answered, flush=True)
-        print(now.isoformat(), result['status'], flush=True)
-    except Exception as error:
-        state['failures'] = state.get('failures', 0) + 1
-        # Alert on the first failure as well, so failed initial setup is visible.
-        if state['failures'] in (1, 3) or state['failures'] % 12 == 0:
-            try:
-                for chat in chat_ids:
-                    try:
-                        send(chat, '⚠️ Проверка билетов или доставка не удалась. '
-                             'Наличие неизвестно. Проверьте вкладку Actions на GitHub.\n' + URL)
-                    except RuntimeError:
-                        print('Telegram delivery failed', flush=True)
-            except RuntimeError:
-                print('Telegram delivery failed', flush=True)
-        save(state_path, state)
-        raise RuntimeError('Scheduled check failed: ' + type(error).__name__) from None
+def browser_check():
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            return check(browser.new_page())
+        finally:
+            browser.close()
+
+
+def scheduled():
+    cycle(os.environ['TELEGRAM_BOT_TOKEN'], configured_chats(os.environ['TELEGRAM_CHAT_ID']),
+          DATA / 'state.json', browser_check)
 
 
 def run(once=False):
-    from playwright.sync_api import sync_playwright
-    config = {} if once else json.loads((DATA / 'config.json').read_text())
-    state_path = DATA / 'state.json'
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if once:
+        print(json.dumps(browser_check(), ensure_ascii=False))
+        return
+    config = json.loads((DATA / 'config.json').read_text())
+    chats = configured_chats(','.join([str(config['chat_id'])] + config.get('extra_chat_ids', [])))
     interval = max(60, int(os.environ.get('CHECK_SECONDS', '60')))
-    hours = sorted(set(int(h) for h in os.environ.get('STATUS_HOURS', '9,15,21').split(',')))
-    if not hours or any(h < 0 or h > 23 for h in hours):
-        raise ValueError('STATUS_HOURS must contain hours from 0 to 23')
-    zone = ZoneInfo(os.environ.get('TIMEZONE', 'Europe/Berlin'))
-    failures = 0
-
-    def send(text):
-        telegram(config['token'], 'sendMessage', chat_id=config['chat_id'], text=text)
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-        while True:
-            started = time.monotonic()
-            now = dt.datetime.now(zone)
-            timestamp = now.isoformat(timespec='seconds')
-            try:
-                result = check(page)
-                print(timestamp, result['status'], flush=True)
-                if once:
-                    print(json.dumps(result, ensure_ascii=False))
-                    return
-                # Alert only once per transition, and persist only AFTER successful delivery.
-                changed = state.get('status') != result['status']
-                if changed:
-                    send(message_for(result))
-                    state['status'] = result['status']
-                    state['last_slot'] = timestamp[:13]
-                    save(state_path, state)
-                if failures >= 3:
-                    send('✅ Проверки восстановились.\n' + message_for(result))
-                failures = 0
-                due = [h for h in hours if h <= now.hour]
-                slot = now.strftime('%Y-%m-%d') + ('T%02d' % due[-1]) if due else None
-                if slot and state.get('last_slot', '') < slot:
-                    send(message_for(result) + '\nПроверено: ' + now.strftime('%d.%m %H:%M %Z'))
-                    state['last_slot'] = slot
-                state['last_success'] = timestamp
-                save(state_path, state)
-            except Exception as error:
-                if once:
-                    raise RuntimeError('Проверка не удалась: ' + type(error).__name__) from None
-                failures += 1
-                print(timestamp, 'check/delivery failed:', type(error).__name__, flush=True)
-                if failures == 3 or failures % 60 == 0:
-                    try:
-                        send('⚠️ Не удаётся проверить ESL или доставить сообщение. '
-                             'Текущее наличие неизвестно. Нужна проверка сервиса.\n' + URL)
-                    except RuntimeError:
-                        print('Telegram unavailable too', flush=True)
-                if page.is_closed():
-                    raise RuntimeError('Browser closed; restart required') from None
-            time.sleep(max(1, interval - (time.monotonic() - started)))
+    while True:
+        started = time.monotonic()
+        try:
+            cycle(config['token'], chats, DATA / 'state.json', browser_check)
+        except RuntimeError as error:
+            print(type(error).__name__ + ': cycle incomplete', flush=True)
+        time.sleep(max(1, interval - (time.monotonic() - started)))
 
 
 if __name__ == '__main__':
