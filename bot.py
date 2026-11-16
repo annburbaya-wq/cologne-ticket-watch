@@ -33,12 +33,14 @@ def save(path, data):
 
 
 class TelegramError(RuntimeError):
-    def __init__(self, message, code=None):
+    def __init__(self, message, code=None, kind='http', retry_after=None):
         super().__init__(message)
         self.code = code
+        self.kind = kind
+        self.retry_after = retry_after
 
 
-def telegram(token, method, **payload):
+def _telegram_once(token, method, **payload):
     if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+', token):
         raise RuntimeError('Неверный формат токена. Скопируйте только токен из BotFather, без кавычек и пояснений.')
     request = urllib.request.Request(
@@ -46,7 +48,7 @@ def telegram(token, method, **payload):
         data=json.dumps(payload).encode(),
         headers={'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(request, timeout=40) as response:
+        with urllib.request.urlopen(request, timeout=max(15, int(payload.get('timeout', 0)) + 10)) as response:
             data = json.load(response)
         if not data.get('ok'):
             raise RuntimeError('Telegram отклонил запрос. Повторите подключение.')
@@ -59,7 +61,16 @@ def telegram(token, method, **payload):
             409: 'Другой процесс уже читает сообщения этого бота (409). Остановите его и повторите подключение.',
             429: 'Слишком много запросов к Telegram (429). Подождите минуту и повторите.',
         }
-        raise TelegramError(messages.get(error.code, 'Telegram вернул HTTP ' + str(error.code) + '. Повторите позже.'), error.code) from None
+        retry_after = None
+        if error.code == 429:
+            try:
+                value = json.load(error).get('parameters', {}).get('retry_after')
+                if isinstance(value, int) and value >= 0:
+                    retry_after = value
+            except (ValueError, TypeError, AttributeError):
+                pass
+        raise TelegramError(messages.get(error.code, 'Telegram вернул HTTP ' + str(error.code) + '. Повторите позже.'),
+                            error.code, retry_after=retry_after) from None
     except urllib.error.URLError as error:
         if isinstance(error.reason, ssl.SSLCertVerificationError):
             message = 'Python не смог проверить сертификат Telegram (SSL). Нужна настройка сертификатов Python.'
@@ -69,14 +80,35 @@ def telegram(token, method, **payload):
             message = 'Telegram не ответил вовремя. Проверьте интернет или VPN и повторите.'
         else:
             message = 'Не удалось соединиться с Telegram. Проверьте интернет или VPN и повторите.'
-        raise RuntimeError(message) from None
+        kind = ('ssl' if isinstance(error.reason, ssl.SSLCertVerificationError) else
+                'timeout' if isinstance(error.reason, (TimeoutError, socket.timeout)) else 'network')
+        raise TelegramError(message, kind=kind) from None
     except (TimeoutError, socket.timeout):
-        raise RuntimeError('Telegram не ответил вовремя. Проверьте интернет или VPN и повторите.') from None
+        raise TelegramError('Telegram не ответил вовремя. Проверьте интернет или VPN и повторите.', kind='timeout') from None
     except RuntimeError:
         raise
     except Exception:
         # Do not leak token-bearing URLs through exception messages.
         raise RuntimeError('Telegram request failed: ' + method) from None
+
+
+def telegram(token, method, **payload):
+    """Retry safe reads; don't repeat an ambiguously delivered sendMessage."""
+    read_only = method in {'getMe', 'getUpdates', 'getChat', 'getWebhookInfo'}
+    for attempt in range(3):
+        try:
+            return _telegram_once(token, method, **payload)
+        except TelegramError as error:
+            retryable = (error.code == 429 or (read_only and
+                         (error.kind in {'network', 'timeout'} or
+                          (error.code is not None and error.code >= 500))))
+            delay = error.retry_after if error.retry_after is not None else (1 if attempt == 0 else 3)
+            if not retryable or attempt == 2 or delay > 10:
+                raise
+            # No token, URL, chat ID, message text, or raw exception in diagnostics.
+            print('Telegram', method, 'retry:', error.kind, error.code or '-',
+                  '; attempt:', attempt + 2, 'of 3', flush=True)
+            time.sleep(delay)
 
 
 def setup():
@@ -276,10 +308,11 @@ def cycle(token, chat_ids, state_path, observe, clock=None):
     try:
         updates = telegram(token, 'getUpdates', offset=state.get('message_offset', 0),
                            limit=100, timeout=0, allowed_updates=['message'])
-    except RuntimeError:
+    except RuntimeError as error:
         updates = []
         delivery_failures += 1
-        print('Telegram polling failed', flush=True)
+        print('Telegram polling failed:', getattr(error, 'kind', 'request'),
+              getattr(error, 'code', None) or '-', flush=True)
     if updates:
         state['updates_received_at'] = now.isoformat()
     def reply(chat, message_id, text):

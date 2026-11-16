@@ -321,5 +321,62 @@ class AuditCycles(unittest.TestCase):
         with self.assertRaises(ValueError):message_for({'status':'unknown'})
 
 
+class TelegramRetries(unittest.TestCase):
+    def test_transient_network_read_recovers(self):
+        failure = TelegramError('network', kind='network')
+        with patch('bot._telegram_once', side_effect=[failure, []]) as request, patch('bot.time.sleep') as sleep:
+            self.assertEqual(telegram('123:secret', 'getUpdates'), [])
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_server_error_read_recovers(self):
+        with patch('bot._telegram_once', side_effect=[TelegramError('server', 503), []]) as request, patch('bot.time.sleep'):
+            self.assertEqual(telegram('123:secret', 'getUpdates'), [])
+        self.assertEqual(request.call_count, 2)
+
+    def test_persistent_read_failure_stops_after_three_attempts(self):
+        with patch('bot._telegram_once', side_effect=TelegramError('network', kind='network')) as request, patch('bot.time.sleep') as sleep:
+            with self.assertRaises(TelegramError):telegram('123:secret', 'getUpdates')
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 3])
+
+    def test_permanent_error_not_retried(self):
+        with patch('bot._telegram_once', side_effect=TelegramError('forbidden', 403)) as request, patch('bot.time.sleep') as sleep:
+            with self.assertRaises(TelegramError):telegram('123:secret', 'sendMessage')
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_ambiguous_send_failure_not_immediately_repeated(self):
+        with patch('bot._telegram_once', side_effect=TelegramError('timeout', kind='timeout')) as request, patch('bot.time.sleep') as sleep:
+            with self.assertRaises(TelegramError):telegram('123:secret', 'sendMessage')
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_rate_limit_waits_for_telegram_retry_after(self):
+        with patch('bot._telegram_once', side_effect=[TelegramError('rate', 429, retry_after=7), {'message_id':1}]), patch('bot.time.sleep') as sleep:
+            self.assertEqual(telegram('123:secret', 'sendMessage'), {'message_id':1})
+        sleep.assert_called_once_with(7)
+
+    def test_long_rate_limit_does_not_sleep_past_job_budget(self):
+        with patch('bot._telegram_once', side_effect=TelegramError('rate', 429, retry_after=600)) as request, patch('bot.time.sleep') as sleep:
+            with self.assertRaises(TelegramError):telegram('123:secret', 'getUpdates')
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_cycle_survives_one_failed_poll_without_false_failure(self):
+        calls = []
+        def request(token, method, **payload):
+            if method == 'getUpdates':
+                calls.append(method)
+                if len(calls) == 1:raise TelegramError('temporary', kind='network')
+                return []
+            return {'message_id':1}
+        with tempfile.TemporaryDirectory() as tmp, patch('bot._telegram_once', side_effect=request), patch('bot.time.sleep'):
+            path = Path(tmp) / 'state.json'
+            cycle('123:secret', ['123', '456'], path, lambda: {'status':'coming_soon'})
+            self.assertEqual(json.loads(path.read_text())['failures'], 0)
+        self.assertEqual(len(calls), 2)
+
+
 if __name__ == '__main__':
     unittest.main()
